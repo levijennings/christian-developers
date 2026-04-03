@@ -1,167 +1,130 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { createClient } from '@/lib/supabase/server';
-import Stripe from 'stripe';
-import { headers } from 'next/headers';
+/**
+ * Christian Developers Billing API - Webhook Handler
+ * POST /api/billing/webhook
+ */
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', {
-  apiVersion: '2023-10-16',
-});
+import { NextRequest, NextResponse } from "next/server";
+import {
+  verifyWebhookSignature,
+  handleCheckoutSessionCompleted,
+  handleSubscriptionUpdated,
+  handleSubscriptionDeleted,
+  handleInvoicePaymentSucceeded,
+  handleInvoicePaymentFailed,
+} from "@/lib/stripe/webhooks";
 
-const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET || '';
+const webhookCallbacks = {
+  onSubscriptionCreated: async (customerId: string, subscription: any) => {
+    console.log(`Subscription created for customer ${customerId}:`, subscription);
+  },
+
+  onApplicationLimitsReset: async (customerId: string) => {
+    console.log(`Application limits reset for customer ${customerId}`);
+  },
+
+  onSubscriptionUpdated: async (subscription: any) => {
+    console.log(`Subscription updated:`, subscription);
+  },
+
+  onPlanChanged: async (customerId: string, oldTier: string, newTier: string) => {
+    console.log(
+      `Plan changed for customer ${customerId}: ${oldTier} -> ${newTier}`
+    );
+  },
+
+  onApplicationLimitsUpdated: async (customerId: string, newTier: string) => {
+    console.log(`Application limits updated for customer ${customerId}: ${newTier}`);
+  },
+
+  onSubscriptionCanceled: async (customerId: string, subscriptionId: string) => {
+    console.log(`Subscription canceled: ${subscriptionId} for customer ${customerId}`);
+  },
+
+  onPaymentSucceeded: async (invoice: any) => {
+    console.log(`Payment succeeded for invoice ${invoice.id}`);
+  },
+
+  onPaymentFailed: async (invoice: any, retryAfter?: Date) => {
+    console.log(`Payment failed for invoice ${invoice.id}, retry after ${retryAfter}`);
+  },
+};
 
 export async function POST(request: NextRequest) {
   try {
     const body = await request.text();
-    const headersList = headers();
-    const signature = headersList.get('stripe-signature');
+    const signature = request.headers.get("stripe-signature");
 
     if (!signature) {
       return NextResponse.json(
-        { error: 'Missing stripe-signature header' },
+        { error: "Missing stripe-signature header" },
         { status: 400 }
       );
     }
 
-    // Verify webhook signature
-    let event: Stripe.Event;
-    try {
-      event = stripe.webhooks.constructEvent(body, signature, webhookSecret);
-    } catch (error) {
-      console.error('Webhook signature verification failed:', error);
+    const secret = process.env.STRIPE_WEBHOOK_SECRET;
+    if (!secret) {
+      console.error("STRIPE_WEBHOOK_SECRET not configured");
       return NextResponse.json(
-        { error: 'Invalid signature' },
-        { status: 400 }
+        { error: "Webhook secret not configured" },
+        { status: 500 }
       );
     }
 
-    const supabase = createClient();
+    const event = await verifyWebhookSignature(body, signature, secret);
+    if (!event) {
+      return NextResponse.json(
+        { error: "Invalid signature" },
+        { status: 403 }
+      );
+    }
 
-    // Handle subscription events
+    console.log(`Received webhook event: ${event.type}`);
+
     switch (event.type) {
-      case 'customer.subscription.updated': {
-        const subscription = event.data.object as Stripe.Subscription;
-        const customerId = subscription.customer as string;
-        const status = subscription.status;
-
-        // Get user from customer ID
-        const { data: profile } = await supabase
-          .from('profiles')
-          .select('id')
-          .eq('stripe_customer_id', customerId)
-          .single();
-
-        if (profile) {
-          const planType = subscription.metadata?.planType || 'free';
-          await supabase
-            .from('profiles')
-            .update({
-              subscription_status: status,
-              subscription_plan: planType,
-              subscription_period_start: new Date(
-                subscription.current_period_start * 1000
-              ).toISOString(),
-              subscription_period_end: new Date(
-                subscription.current_period_end * 1000
-              ).toISOString(),
-            })
-            .eq('id', profile.id);
-        }
-        break;
-      }
-
-      case 'customer.subscription.created': {
-        const subscription = event.data.object as Stripe.Subscription;
-        const customerId = subscription.customer as string;
-        const status = subscription.status;
-
-        const { data: profile } = await supabase
-          .from('profiles')
-          .select('id')
-          .eq('stripe_customer_id', customerId)
-          .single();
-
-        if (profile) {
-          const planType = subscription.metadata?.planType || 'free';
-          await supabase
-            .from('profiles')
-            .update({
-              subscription_status: status,
-              subscription_plan: planType,
-              subscription_period_start: new Date(
-                subscription.current_period_start * 1000
-              ).toISOString(),
-              subscription_period_end: new Date(
-                subscription.current_period_end * 1000
-              ).toISOString(),
-            })
-            .eq('id', profile.id);
-        }
-        break;
-      }
-
-      case 'customer.subscription.deleted': {
-        const subscription = event.data.object as Stripe.Subscription;
-        const customerId = subscription.customer as string;
-
-        const { data: profile } = await supabase
-          .from('profiles')
-          .select('id')
-          .eq('stripe_customer_id', customerId)
-          .single();
-
-        if (profile) {
-          await supabase
-            .from('profiles')
-            .update({
-              subscription_status: 'canceled',
-              subscription_plan: 'free',
-            })
-            .eq('id', profile.id);
-        }
-        break;
-      }
-
-      case 'invoice.payment_succeeded': {
-        const invoice = event.data.object as Stripe.Invoice;
-        const customerId = invoice.customer as string;
-
-        const { data: profile } = await supabase
-          .from('profiles')
-          .select('id')
-          .eq('stripe_customer_id', customerId)
-          .single();
-
-        if (profile) {
-          // Update invoice status
-          await supabase
-            .from('profiles')
-            .update({
-              last_invoice_paid_at: new Date(invoice.created * 1000).toISOString(),
-            })
-            .eq('id', profile.id);
-        }
-        break;
-      }
-
-      case 'invoice.payment_failed': {
-        const invoice = event.data.object as Stripe.Invoice;
-        console.warn('Invoice payment failed:', {
-          invoiceId: invoice.id,
-          customerId: invoice.customer,
-          amount: invoice.amount_due,
+      case "checkout.session.completed":
+        await handleCheckoutSessionCompleted(event, {
+          onSubscriptionCreated: webhookCallbacks.onSubscriptionCreated,
+          onApplicationLimitsReset: webhookCallbacks.onApplicationLimitsReset,
         });
         break;
-      }
+
+      case "customer.subscription.updated":
+        await handleSubscriptionUpdated(event, {
+          onSubscriptionUpdated: webhookCallbacks.onSubscriptionUpdated,
+          onPlanChanged: webhookCallbacks.onPlanChanged,
+          onApplicationLimitsUpdated: webhookCallbacks.onApplicationLimitsUpdated,
+        });
+        break;
+
+      case "customer.subscription.deleted":
+        await handleSubscriptionDeleted(event, {
+          onSubscriptionCanceled: webhookCallbacks.onSubscriptionCanceled,
+          onApplicationLimitsReset: webhookCallbacks.onApplicationLimitsReset,
+        });
+        break;
+
+      case "invoice.payment_succeeded":
+        await handleInvoicePaymentSucceeded(event, {
+          onPaymentSucceeded: webhookCallbacks.onPaymentSucceeded,
+        });
+        break;
+
+      case "invoice.payment_failed":
+        await handleInvoicePaymentFailed(event, {
+          onPaymentFailed: webhookCallbacks.onPaymentFailed,
+        });
+        break;
 
       default:
-        console.log(`Unhandled event type: ${event.type}`);
+        console.warn(`Unhandled webhook event type: ${event.type}`);
     }
 
     return NextResponse.json({ received: true }, { status: 200 });
   } catch (error) {
-    console.error('Webhook error:', error);
+    console.error("Webhook error:", error);
+
     return NextResponse.json(
-      { error: 'Webhook processing failed' },
+      { error: "Webhook processing failed" },
       { status: 500 }
     );
   }
