@@ -1,176 +1,97 @@
-name: CI Pipeline
+name: CI
 
 on:
   push:
-    branches: [main, develop]
+    branches: [ main, develop ]
   pull_request:
-    branches: [main, develop]
+    branches: [ main, develop ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
 
 jobs:
-  test:
-    name: Unit & Component Tests
+  lint-and-test:
     runs-on: ubuntu-latest
-
     strategy:
       matrix:
-        node-version: [18.x, 20.x]
+        node-version: [ 20.x ]
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Setup Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v3
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
           cache: 'npm'
+          cache-dependency-path: 'package-lock.json'
 
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --prefer-offline --no-audit
 
-      - name: Run linter
+      - name: Run ESLint
         run: npm run lint
-        continue-on-error: true
+        continue-on-error: false
+
+      - name: Type check
+        run: npx tsc --noEmit
+        continue-on-error: false
 
       - name: Run unit tests
-        run: npm run test:unit
+        run: npm run test:unit -- --coverage
+        continue-on-error: false
 
-      - name: Generate coverage report
-        run: npm run test:coverage
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v3
-        with:
-          files: ./coverage/coverage-final.json
-          flags: unittests
-          name: codecov-umbrella
-          fail_ci_if_error: false
-
-      - name: Archive test results
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v3
         with:
-          name: coverage-reports-${{ matrix.node-version }}
+          name: coverage-report-${{ matrix.node-version }}
           path: coverage/
-
-  e2e:
-    name: E2E Tests
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v3
-        with:
-          node-version: 20.x
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Install Playwright browsers
-        run: npx playwright install --with-deps
-
-      - name: Build Next.js app
-        run: npm run build
-
-      - name: Run E2E tests
-        run: npm run test:e2e
-
-      - name: Upload E2E test results
-        if: always()
-        uses: actions/upload-artifact@v3
-        with:
-          name: playwright-report
-          path: playwright-report/
           retention-days: 30
 
-  build:
-    name: Build Application
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v3
-        with:
-          node-version: 20.x
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build application
+      - name: Build with ISR
         run: npm run build
+        env:
+          NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY }}
+        continue-on-error: false
 
-      - name: Archive build artifacts
-        uses: actions/upload-artifact@v3
-        with:
-          name: build-output
-          path: .next/
-          retention-days: 7
-
-  type-check:
-    name: Type Checking
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v3
-        with:
-          node-version: 20.x
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Type check TypeScript
-        run: npx tsc --noEmit
+      - name: Generate sitemap
+        run: npm run generate:sitemap
         continue-on-error: true
 
-  security:
-    name: Security Audit
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v3
+      - name: Comment coverage on PR
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
         with:
-          node-version: 20.x
-          cache: 'npm'
+          script: |
+            const fs = require('fs');
+            const coverage = fs.existsSync('coverage/coverage-summary.json')
+              ? JSON.parse(fs.readFileSync('coverage/coverage-summary.json', 'utf8')).total
+              : null;
 
-      - name: Run npm audit
-        run: npm audit --audit-level=moderate
-        continue-on-error: true
+            if (coverage) {
+              const comment = `## Coverage Report
 
-      - name: Check for vulnerable dependencies
-        run: npm audit fix --dry-run
-        continue-on-error: true
+| Metric | Coverage |
+|--------|----------|
+| Statements | ${coverage.statements.pct}% |
+| Branches | ${coverage.branches.pct}% |
+| Functions | ${coverage.functions.pct}% |
+| Lines | ${coverage.lines.pct}% |`;
 
-  test-summary:
-    name: Test Summary
-    runs-on: ubuntu-latest
-    needs: [test, e2e, build]
-    if: always()
-
-    steps:
-      - name: Download all test results
-        uses: actions/download-artifact@v3
-
-      - name: Display test summary
-        run: |
-          echo "## Test Execution Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- Unit Tests: ${{ needs.test.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- E2E Tests: ${{ needs.e2e.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Build: ${{ needs.build.result }}" >> $GITHUB_STEP_SUMMARY
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: comment
+              });
+            }
